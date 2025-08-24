@@ -1,0 +1,209 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'staging | production'
+      api_tags:
+        required: true
+        type: string
+        description: 'Tags da imagem API (separadas por nova linha) do metadata-action'
+      web_tags:
+        required: true
+        type: string
+        description: 'Tags da imagem WEB (separadas por nova linha) do metadata-action'
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+      SSH_PORT:
+        required: false
+      REMOTE_DOCKER_LOGIN_USERNAME:
+        required: false
+      REMOTE_DOCKER_LOGIN_PASSWORD:
+        required: false
+      ENV_FILE:    # opcional: conteúdo de um .env remoto
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: Target environment
+        options: [staging, production]
+        default: staging
+      api_ref:
+        type: string
+        description: "Ref da imagem API (ex: ghcr.io/owner/repo/api:tag)"
+        required: false
+      web_ref:
+        type: string
+        description: "Ref da imagem WEB (ex: ghcr.io/owner/repo/web:tag)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.environment == 'production' && vars.PROD_URL || vars.STAGING_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    env:
+      REGISTRY: ghcr.io
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      # Diretório no servidor onde ficam docker-compose.yml e .env
+      REMOTE_DIR: ${{ vars.REMOTE_DIR || '/opt/app' }}
+      # Nomes de serviços no docker-compose
+      API_SERVICE: api
+      WEB_SERVICE: web
+
+    steps:
+      - name: Resolve image refs from inputs
+        id: refs
+        run: |
+          set -euo pipefail
+          # Se vier chamado via workflow_call (release), priorizamos tags listadas
+          if [ -n "${{ inputs.api_tags }}" ]; then
+            # escolhe a primeira tag "melhor" (preferência: semver, latest, edge, sha)
+            API_TAG=$(printf '%s\n' "${{ inputs.api_tags }}" | grep -E ':[0-9]+\.[0-9]+\.[0-9]+' || true | head -n1)
+            if [ -z "$API_TAG" ]; then
+              API_TAG=$(printf '%s\n' "${{ inputs.api_tags }}" | grep ':latest' || true | head -n1)
+            fi
+            if [ -z "$API_TAG" ]; then
+              API_TAG=$(printf '%s\n' "${{ inputs.api_tags }}" | grep ':edge' || true | head -n1)
+            fi
+            if [ -z "$API_TAG" ]; then
+              API_TAG=$(printf '%s\n' "${{ inputs.api_tags }}" | head -n1)
+            fi
+            echo "API_REF=$API_TAG" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -n "${{ inputs.web_tags }}" ]; then
+            WEB_TAG=$(printf '%s\n' "${{ inputs.web_tags }}" | grep -E ':[0-9]+\.[0-9]+\.[0-9]+' || true | head -n1)
+            if [ -z "$WEB_TAG" ]; then
+              WEB_TAG=$(printf '%s\n' "${{ inputs.web_tags }}" | grep ':latest' || true | head -n1)
+            fi
+            if [ -z "$WEB_TAG" ]; then
+              WEB_TAG=$(printf '%s\n' "${{ inputs.web_tags }}" | grep ':edge' || true | head -n1)
+            fi
+            if [ -z "$WEB_TAG" ]; then
+              WEB_TAG=$(printf '%s\n' "${{ inputs.web_tags }}" | head -n1)
+            fi
+            echo "WEB_REF=$WEB_TAG" >> $GITHUB_OUTPUT
+          fi
+
+          # Se for dispatch manual, use as refs informadas ou defaults de latest
+          if [ -z "${{ steps.refs.outputs.API_REF }}" ] && [ -n "${{ inputs.api_ref }}" ]; then
+            echo "API_REF=${{ inputs.api_ref }}" >> $GITHUB_OUTPUT
+          fi
+          if [ -z "${{ steps.refs.outputs.WEB_REF }}" ] && [ -n "${{ inputs.web_ref }}" ]; then
+            echo "WEB_REF=${{ inputs.web_ref }}" >> $GITHUB_OUTPUT
+          fi
+
+          # Defaults
+          if [ -z "${{ steps.refs.outputs.API_REF }}" ]; then
+            echo "API_REF=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}/api:latest" >> $GITHUB_OUTPUT
+          fi
+          if [ -z "${{ steps.refs.outputs.WEB_REF }}" ]; then
+            echo "WEB_REF=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}/web:latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print chosen images
+        run: |
+          echo "API_REF=${{ steps.refs.outputs.API_REF }}"
+          echo "WEB_REF=${{ steps.refs.outputs.WEB_REF }}"
+
+      - name: Install SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Prepare .env for remote (optional)
+        if: ${{ secrets.ENV_FILE != '' }}
+        run: |
+          echo "${{ secrets.ENV_FILE }}" > .env.remote
+
+      - name: Copy files (compose/.env) to remote
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          source: |
+            docker-compose.yml
+            .env.remote
+          target: ${{ env.REMOTE_DIR }}
+          overwrite: true
+        if: ${{ secrets.ENV_FILE != '' }}
+
+      - name: Copy compose only (if no env file)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          source: docker-compose.yml
+          target: ${{ env.REMOTE_DIR }}
+          overwrite: true
+        if: ${{ secrets.ENV_FILE == '' }}
+
+      - name: Remote deploy via SSH (login, pull, migrate, up)
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          API_REF: ${{ steps.refs.outputs.API_REF }}
+          WEB_REF: ${{ steps.refs.outputs.WEB_REF }}
+          DOCKER_LOGIN_USER: ${{ secrets.REMOTE_DOCKER_LOGIN_USERNAME || github.actor }}
+          DOCKER_LOGIN_PASS: ${{ secrets.REMOTE_DOCKER_LOGIN_PASSWORD || secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          script_stop: true
+          envs: API_REF,WEB_REF,DOCKER_LOGIN_USER,DOCKER_LOGIN_PASS,REMOTE_DIR,API_SERVICE,WEB_SERVICE
+          script: |
+            set -euo pipefail
+            cd "$REMOTE_DIR"
+
+            echo "Docker login..."
+            echo "$DOCKER_LOGIN_PASS" | docker login ghcr.io -u "$DOCKER_LOGIN_USER" --password-stdin
+
+            echo "Docker compose pull with new tags..."
+            DOCKER_DEFAULT_PLATFORM= docker compose pull $(echo $API_SERVICE) $(echo $WEB_SERVICE)
+
+            echo "Override images in compose (if needed) and migrate db..."
+            # Se seu compose usa "image: ..." fixo, garanta que já referencia as tags passadas (API_REF/WEB_REF).
+            # Migrations Prisma (distroless, sem shell): chama o binário do Prisma via node
+            docker compose run --rm \
+              -e DATABASE_URL \
+              --entrypoint "node" \
+              $API_SERVICE \
+              node_modules/prisma/build/index.js migrate deploy
+
+            echo "Docker compose up -d..."
+            docker compose up -d
+
+            echo "Pruning old images..."
+            docker image prune -f
+
+      - name: Output URL
+        if: always()
+        run: |
+          echo "Deployed to ${{ inputs.environment }}: ${{ job.environment.url || 'set env var STAGING_URL/PROD_URL' }}"
