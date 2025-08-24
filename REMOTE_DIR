@@ -1,0 +1,20 @@
+services:
+  api:
+    image: ghcr.io/SEU_OWNER_AQUI/SEU_REPO_AQUI/api:latest
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    restart: always
+
+  web:
+    image: ghcr.io/SEU_OWNER_AQUI/SEU_REPO_AQUI/web:latest
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "80:80"
+    restart: always
